@@ -19,13 +19,22 @@ pc.defineParameter(
     "node0_type",
     "Node 0 (Junction) hardware type",
     portal.ParameterType.NODETYPE,
-    "c6525-100g",
+    "c6525-25g",
 )
 pc.defineParameter(
     "node1_type",
     "Node 1 (workload) hardware type",
     portal.ParameterType.NODETYPE,
-    "c6525-100g",
+    "c6525-25g",
+)
+# Cluster must match the node types: c6525-25g/xl170 -> utah, c220g5/c220g2 -> wisc,
+# c6420 -> clemson.
+pc.defineParameter(
+    "cluster",
+    "CloudLab cluster",
+    portal.ParameterType.STRING,
+    "utah",
+    [("utah", "Utah"), ("wisc", "Wisconsin"), ("clemson", "Clemson")],
 )
 pc.defineParameter(
     "junction_repo",
@@ -50,7 +59,8 @@ pc.defineParameter(
 params = pc.bindParameters()
 pc.verifyParameters()
 
-IMAGE = "urn:publicid:IDN+emulab.net+image+emulab-ops:UBUNTU24-64-STD"
+IMAGE = "urn:publicid:IDN+%s.cloudlab.us+image+emulab-ops:UBUNTU24-64-STD" % params.cluster
+CM = "urn:publicid:IDN+%s.cloudlab.us+authority+cm" % params.cluster
 
 SETUP_COMMON = r"""
 set -x
@@ -61,6 +71,7 @@ cd /local
 cd junction
 sudo apt-get update
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y git build-essential
+{extra}
 # Rust (nightly, per Junction README)
 if [ ! -x $HOME/.cargo/bin/rustc ]; then
   curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain=nightly
@@ -80,16 +91,20 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
 def setup_cmd(extra=""):
     build = "./scripts/build.sh" if params.build_junction else "true"
     body = SETUP_COMMON.format(
-        branch=params.junction_branch, repo=params.junction_repo, build=build
+        branch=params.junction_branch,
+        repo=params.junction_repo,
+        build=build,
+        extra=extra,
     )
     # Run detached so the profile instantiates immediately.
-    script = body + extra
+    script = body
     return "nohup bash -c '%s' >/dev/null 2>&1 &" % script.replace("'", "'\\''")
 
 
 # ---- Node 0: Junction dev node ----
 node0 = request.RawPC("node0")
 node0.hardware_type = params.node0_type
+node0.component_manager_id = CM
 node0.disk_image = IMAGE
 iface0 = node0.addInterface("data0")
 iface0.addAddress(rspec.IPv4Address("10.10.1.1", "255.255.255.0"))
@@ -98,6 +113,7 @@ node0.addService(rspec.Execute(shell="bash", command=setup_cmd()))
 # ---- Node 1: workload node ----
 node1 = request.RawPC("node1")
 node1.hardware_type = params.node1_type
+node1.component_manager_id = CM
 node1.disk_image = IMAGE
 iface1 = node1.addInterface("data0")
 iface1.addAddress(rspec.IPv4Address("10.10.1.2", "255.255.255.0"))
