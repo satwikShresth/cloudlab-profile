@@ -142,7 +142,7 @@ sudo apt-get update
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y git build-essential \
   libreadline-dev zlib1g-dev bison flex libicu-dev pkg-config
 {extra}
-# Rust (nightly, per Junction README) in a shared location, not one user's home.
+# Rust (nightly, per Junction README) in a shared location, not a home dir.
 export RUSTUP_HOME=/local/rust/rustup CARGO_HOME=/local/rust/cargo
 export PATH=$CARGO_HOME/bin:$PATH
 if [ ! -x $CARGO_HOME/bin/rustc ]; then
@@ -168,6 +168,8 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
 
 
 def setup_cmd(extra=""):
+    # CloudLab's runner mangles escaped single quotes, so the body has none.
+    assert "'" not in SETUP_COMMON + extra
     if params.build_junction:
         build = "./scripts/build.sh" + (" -w" if params.writable_fs else "")
     else:
@@ -179,7 +181,7 @@ def setup_cmd(extra=""):
         extra=extra,
     )
     # Run detached so the profile instantiates immediately.
-    return "nohup bash -c '%s' >/dev/null 2>&1 &" % body.replace("'", "'\\''")
+    return "nohup bash -c '%s' >/dev/null 2>&1 &" % body
 
 
 def add_workload_node(iface0):
