@@ -1,10 +1,11 @@
 """Junction + PostgreSQL testbed on CloudLab.
 
-Two bare-metal nodes on a direct experiment link:
+One or two bare-metal nodes:
   node0 - Junction / Postgres server node (iokerneld + junction_run + postgres)
-  node1 - workload / client node (pgbench and other load generators)
+  node1 - optional workload / client node (pgbench and other load generators),
+          on a direct experiment link with node0
 
-Both nodes clone Junction to /local/junction, install its dependencies and the
+Each node clones Junction to /local/junction, install its dependencies and the
 PostgreSQL build dependencies, and (optionally) build Junction, all in the
 background. Progress: /local/setup.log. When it finishes, /local/setup.done
 (success) or /local/setup.failed (look at the log) appears.
@@ -38,18 +39,25 @@ pc = portal.Context()
 request = pc.makeRequestRSpec()
 
 pc.defineParameter(
+    "num_nodes",
+    "Number of nodes",
+    portal.ParameterType.INTEGER,
+    1,
+    [(1, "1 (node0 only; run pgbench locally)"), (2, "2 (node0 + workload node1)")],
+)
+pc.defineParameter(
     "node0_type",
     "Node 0 (Junction + Postgres) hardware type",
     portal.ParameterType.NODETYPE,
-    "r6615",
-    longDescription="r6615 (Clemson): AMD EPYC 9354P, NVMe, Mellanox CX-6. "
-    "Fallback: c6620 (Utah).",
+    "c6620",
+    longDescription="c6620 (Utah): Intel Xeon Gold 5512U, NVMe, Intel E810. "
+    "Alternative: r6615 (Clemson, AMD EPYC 9354P, Mellanox CX-6).",
 )
 pc.defineParameter(
     "node1_type",
     "Node 1 (workload) hardware type",
     portal.ParameterType.NODETYPE,
-    "r6615",
+    "c6620",
 )
 pc.defineParameter(
     "cluster",
@@ -90,7 +98,9 @@ params = pc.bindParameters()
 
 # ---- Check that node types and cluster agree ----
 cluster = params.cluster
-types = [("node0_type", params.node0_type), ("node1_type", params.node1_type)]
+types = [("node0_type", params.node0_type)]
+if params.num_nodes == 2:
+    types.append(("node1_type", params.node1_type))
 known = [(name, t, NODE_CLUSTER[t]) for name, t in types if t in NODE_CLUSTER]
 
 if cluster == "auto":
@@ -172,29 +182,36 @@ def setup_cmd(extra=""):
     return "nohup bash -c '%s' >/dev/null 2>&1 &" % body.replace("'", "'\\''")
 
 
+def add_workload_node(iface0):
+    """node1 plus a direct link to node0's data0 interface."""
+    node1 = request.RawPC("node1")
+    node1.hardware_type = params.node1_type
+    node1.component_manager_id = CM
+    node1.disk_image = IMAGE
+    iface1 = node1.addInterface("data0")
+    iface1.addAddress(rspec.IPv4Address("10.10.1.2", "255.255.255.0"))
+    node1.addService(rspec.Execute(shell="bash", command=setup_cmd(WORKLOAD_EXTRAS)))
+    link = request.Link("data-link")
+    link.addInterface(iface0)
+    link.addInterface(iface1)
+    if params.link_bw_kbps:
+        link.bandwidth = params.link_bw_kbps
+
+
+two_nodes = params.num_nodes == 2
+
 # ---- Node 0: Junction + Postgres node ----
 node0 = request.RawPC("node0")
 node0.hardware_type = params.node0_type
 node0.component_manager_id = CM
 node0.disk_image = IMAGE
-iface0 = node0.addInterface("data0")
-iface0.addAddress(rspec.IPv4Address("10.10.1.1", "255.255.255.0"))
-node0.addService(rspec.Execute(shell="bash", command=setup_cmd()))
+# With one node, node0 also carries the load-generator tools.
+node0.addService(rspec.Execute(
+    shell="bash", command=setup_cmd("" if two_nodes else WORKLOAD_EXTRAS)))
 
-# ---- Node 1: workload node ----
-node1 = request.RawPC("node1")
-node1.hardware_type = params.node1_type
-node1.component_manager_id = CM
-node1.disk_image = IMAGE
-iface1 = node1.addInterface("data0")
-iface1.addAddress(rspec.IPv4Address("10.10.1.2", "255.255.255.0"))
-node1.addService(rspec.Execute(shell="bash", command=setup_cmd(WORKLOAD_EXTRAS)))
-
-# ---- Experiment link ----
-link = request.Link("data-link")
-link.addInterface(iface0)
-link.addInterface(iface1)
-if params.link_bw_kbps:
-    link.bandwidth = params.link_bw_kbps
+if two_nodes:
+    iface0 = node0.addInterface("data0")
+    iface0.addAddress(rspec.IPv4Address("10.10.1.1", "255.255.255.0"))
+    add_workload_node(iface0)
 
 pc.printRequestRSpec(request)
