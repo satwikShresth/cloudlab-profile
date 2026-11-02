@@ -1,40 +1,64 @@
-"""Junction development testbed on CloudLab.
+"""Junction + PostgreSQL testbed on CloudLab.
 
 Two bare-metal nodes on a direct experiment link:
-  node0 - Junction dev/build node (runs iokerneld + junction_run)
-  node1 - workload / client node (load generators, iperf3, etc.)
+  node0 - Junction / Postgres server node (iokerneld + junction_run + postgres)
+  node1 - workload / client node (pgbench and other load generators)
 
-Both nodes get Junction cloned to /local/junction and the dependency install
-(scripts/install.sh) run in the background. Progress: /local/setup.log,
-completion marker: /local/setup.done
+Both nodes clone Junction to /local/junction, install its dependencies and the
+PostgreSQL build dependencies, and (optionally) build Junction, all in the
+background. Progress: /local/setup.log. When it finishes, /local/setup.done
+(success) or /local/setup.failed (look at the log) appears.
+
+Rust is installed to /local/rust and /local/junction is made writable by all
+users, so the build works no matter which account the setup runs as.
 """
 
 import geni.portal as portal
 import geni.rspec.pg as rspec
+
+# Which cluster each node type lives on. "auto" uses this to pick the cluster,
+# and the profile refuses a node type that does not exist on the chosen one.
+NODE_CLUSTER = {
+    # Utah
+    "c6525-25g": "utah", "c6525-100g": "utah", "c6620": "utah",
+    "d6515": "utah", "d750": "utah", "d760": "utah", "d7615": "utah",
+    "xl170": "utah", "m510": "utah", "m400": "utah",
+    # Clemson
+    "r6615": "clemson", "r6525": "clemson", "r7525": "clemson",
+    "r650": "clemson", "c6420": "clemson", "c6320": "clemson",
+    "c8220": "clemson", "c8220x": "clemson", "ibm8335": "clemson",
+    "c4130": "clemson",
+    # Wisconsin
+    "c220g1": "wisc", "c220g2": "wisc", "c220g5": "wisc",
+    "c240g1": "wisc", "c240g2": "wisc", "c240g5": "wisc",
+    "d7525": "wisc", "d8545": "wisc", "sm110p": "wisc", "sm220u": "wisc",
+}
 
 pc = portal.Context()
 request = pc.makeRequestRSpec()
 
 pc.defineParameter(
     "node0_type",
-    "Node 0 (Junction) hardware type",
+    "Node 0 (Junction + Postgres) hardware type",
     portal.ParameterType.NODETYPE,
-    "c6525-25g",
+    "r6615",
+    longDescription="r6615 (Clemson): AMD EPYC 9354P, NVMe, Mellanox CX-6. "
+    "Fallback: c6620 (Utah).",
 )
 pc.defineParameter(
     "node1_type",
     "Node 1 (workload) hardware type",
     portal.ParameterType.NODETYPE,
-    "c6525-25g",
+    "r6615",
 )
-# Cluster must match the node types: c6525-25g/xl170 -> utah, c220g5/c220g2 -> wisc,
-# c6420 -> clemson.
 pc.defineParameter(
     "cluster",
     "CloudLab cluster",
     portal.ParameterType.STRING,
-    "utah",
-    [("utah", "Utah"), ("wisc", "Wisconsin"), ("clemson", "Clemson")],
+    "auto",
+    [("auto", "Auto (from node type)"), ("utah", "Utah"), ("wisc", "Wisconsin"),
+     ("clemson", "Clemson")],
+    longDescription="Auto picks the cluster that has the chosen node type.",
 )
 pc.defineParameter(
     "junction_repo",
@@ -49,6 +73,12 @@ pc.defineParameter(
     "build_junction", "Build Junction after install", portal.ParameterType.BOOLEAN, True
 )
 pc.defineParameter(
+    "writable_fs",
+    "Build Junction with a writable host filesystem (needed for Postgres)",
+    portal.ParameterType.BOOLEAN,
+    True,
+)
+pc.defineParameter(
     "link_bw_kbps",
     "Link bandwidth (Kbps, 0 = default)",
     portal.ParameterType.INTEGER,
@@ -57,28 +87,67 @@ pc.defineParameter(
 )
 
 params = pc.bindParameters()
+
+# ---- Check that node types and cluster agree ----
+cluster = params.cluster
+types = [("node0_type", params.node0_type), ("node1_type", params.node1_type)]
+known = [(name, t, NODE_CLUSTER[t]) for name, t in types if t in NODE_CLUSTER]
+
+if cluster == "auto":
+    sites = set(site for _, _, site in known)
+    if len(known) < len(types):
+        pc.reportError(portal.ParameterError(
+            "Unknown node type; pick the cluster by hand instead of Auto.",
+            ["cluster"]))
+    elif len(sites) > 1:
+        pc.reportError(portal.ParameterError(
+            "node0 and node1 types are on different clusters (%s); "
+            "pick types from one cluster." % ", ".join(sorted(sites)),
+            ["node0_type", "node1_type"]))
+    else:
+        cluster = sites.pop()
+else:
+    for name, t, site in known:
+        if site != cluster:
+            pc.reportError(portal.ParameterError(
+                "%s is only on the %s cluster, not %s." % (t, site, cluster),
+                [name, "cluster"]))
+
 pc.verifyParameters()
 
-IMAGE = "urn:publicid:IDN+%s.cloudlab.us+image+emulab-ops:UBUNTU24-64-STD" % params.cluster
-CM = "urn:publicid:IDN+%s.cloudlab.us+authority+cm" % params.cluster
+IMAGE = "urn:publicid:IDN+%s.cloudlab.us+image+emulab-ops:UBUNTU24-64-STD" % cluster
+CM = "urn:publicid:IDN+%s.cloudlab.us+authority+cm" % cluster
 
 SETUP_COMMON = r"""
 set -x
 exec > >(sudo tee -a /local/setup.log) 2>&1
-sudo mkdir -p /local && sudo chown $(id -u):$(id -g) /local
+sudo mkdir -p /local && sudo chmod 1777 /local
 cd /local
+rm -f /local/setup.done /local/setup.failed
 [ -d junction ] || git clone --branch {branch} {repo} junction
-cd junction
+sudo chmod -R a+rwX /local/junction
+cd /local/junction
+
 sudo apt-get update
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y git build-essential
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y git build-essential \
+  libreadline-dev zlib1g-dev bison flex libicu-dev pkg-config
 {extra}
-# Rust (nightly, per Junction README)
-if [ ! -x $HOME/.cargo/bin/rustc ]; then
-  curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain=nightly
+# Rust (nightly, per Junction README) in a shared location, not one user's home.
+export RUSTUP_HOME=/local/rust/rustup CARGO_HOME=/local/rust/cargo
+export PATH=$CARGO_HOME/bin:$PATH
+if [ ! -x $CARGO_HOME/bin/rustc ]; then
+  curl https://sh.rustup.rs -sSf | sh -s -- -y --no-modify-path --default-toolchain=nightly
 fi
-./scripts/install.sh
-{build}
-touch /local/setup.done
+sudo chmod -R a+rwX /local/rust
+printf "export RUSTUP_HOME=/local/rust/rustup CARGO_HOME=/local/rust/cargo\nexport PATH=/local/rust/cargo/bin:\$PATH\n" \
+  | sudo tee /etc/profile.d/rust.sh
+
+if ./scripts/install.sh && {build}; then
+  touch /local/setup.done
+else
+  touch /local/setup.failed
+fi
+sudo chmod -R a+rwX /local/junction /local/rust
 """
 
 WORKLOAD_EXTRAS = r"""
@@ -89,7 +158,10 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
 
 
 def setup_cmd(extra=""):
-    build = "./scripts/build.sh" if params.build_junction else "true"
+    if params.build_junction:
+        build = "./scripts/build.sh" + (" -w" if params.writable_fs else "")
+    else:
+        build = "true"
     body = SETUP_COMMON.format(
         branch=params.junction_branch,
         repo=params.junction_repo,
@@ -97,11 +169,10 @@ def setup_cmd(extra=""):
         extra=extra,
     )
     # Run detached so the profile instantiates immediately.
-    script = body
-    return "nohup bash -c '%s' >/dev/null 2>&1 &" % script.replace("'", "'\\''")
+    return "nohup bash -c '%s' >/dev/null 2>&1 &" % body.replace("'", "'\\''")
 
 
-# ---- Node 0: Junction dev node ----
+# ---- Node 0: Junction + Postgres node ----
 node0 = request.RawPC("node0")
 node0.hardware_type = params.node0_type
 node0.component_manager_id = CM
